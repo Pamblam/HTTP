@@ -580,6 +580,9 @@ class HTTP_Cookiejar{
 		return true;
 	}
 	
+	/**
+	 * Initialize the cookie jar
+	 */
 	private function initCookiejar(){
 		$data = array(
 			'created' => time(),
