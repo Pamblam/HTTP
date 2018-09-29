@@ -1,7 +1,8 @@
 <?php
-
-// reference https://faculty.cs.byu.edu/~rodham/cs462/lecture-notes/day-09-web-programming/diagrams-HTTP.pdf
-// cookies: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie
+/**
+ * @author Pamblam
+ * @license MIT
+ */
 
 class HTTP{
 	public static function Request($uri){
@@ -223,6 +224,7 @@ class HTTP_Request{
 	 */
 	public function setCookiejar($filename){
 		$this->cookiejar = new HTTP_Cookiejar($filename);
+		return $this;
 	}
 	
 	/**
@@ -240,14 +242,22 @@ class HTTP_Request{
 	 */
 	public function send(){
 		$request = $this->buildRequest();
-		$socket = fsockopen($this->host, $this->port, $errno, $errstr, $this->timeout);
+		$host = $this->protocol === "https" ? "ssl://{$this->host}" : $this->host;
+		$socket = fsockopen($host, $this->port, $errno, $errstr, $this->timeout);
 		if (!$socket) throw new Exception("Error $errno: $errstr");
 		fwrite($socket, $request);
 		$contents = array();
 		while(!feof($socket)) $contents[] = fgets($socket, 4096);
 		fclose($socket);
 		$contents = implode("", $contents);
-		return new HTTP_Response($contents);
+		$response = new HTTP_Response($contents);
+		$headers = $response->getHeaders();
+		if(isset($headers['Set-Cookie']) && !empty($this->cookiejar)){
+			if(!is_array($headers['Set-Cookie'])) $this->cookiejar->addRawCookie($headers['Set-Cookie'], $this->host, $this->protocol);
+			else foreach($headers['Set-Cookie'] as $header) $this->cookiejar->addRawCookie($header, $this->host, $this->protocol);
+			$this->cookiejar->save();
+		}
+		return $response;
 	}
 	
 	/**
@@ -405,6 +415,10 @@ class HTTP_Request{
 		$headers = array("{$this->method} {$this->path} HTTP/1.1");
 		$host = isset($this->headers['host']) ? $this->headers['host'] : $this->host;
 		$headers[] = "Host: $host";
+		if(!empty($this->cookiejar)){
+			$cookies = $this->cookiejar->getApplicableCookies($this->host, $this->path, $this->protocol);
+			if(!empty($cookies)) $headers[] = 'Cookie: '.$cookies.';';
+		}
 		foreach($this->headers as $k=>$v){
 			if($k === "Host") continue;
 			if(in_array($k, $this->omitHeaders)) continue;
@@ -543,6 +557,80 @@ class HTTP_Cookiejar{
 	public function __construct($filename){
 		$this->filename = $filename;
 		$this->validateFile();
+		$data = json_decode(file_get_contents($this->filename), true);
+		$this->created = $data['created'];
+		$this->modified = $data['modified'];
+		$this->cookies = $data['cookies'];
+	}
+	
+	/**
+	 * Add and parse a raw cookie value
+	 * @param string $str
+	 * @param string $host
+	 * @param string $protocol
+	 */
+	public function addRawCookie($str, $host, $protocol){
+		$directives = explode(';', $str);
+		$nv = explode("=", array_shift($directives));
+		$name = trim($nv[0]);
+		$value = trim(urldecode($nv[1]),'" ');
+		$Expires=null; $Domain=$host; $Path='/'; $Secure=null; $HttpOnly=null; $SameSite=false;
+		foreach($directives as $directive){
+			$directive = trim($directive);
+			if(0 === strpos($directive, "Max-Age")){
+				$p = explode("=", $directive);
+				$Expires = time() + trim($p[1]);
+			}else if(0 === strpos($directive, "Expires") && is_null($Expires)){
+				$p = explode("=", $directive);
+				$Expires = strtotime(trim($p[1]));
+			}else if(0 === strpos($directive, "Domain")){
+				$p = explode("=", $directive);
+				$Domain = trim($p[1]);
+			}else if(0 === strpos($directive, "Path")){
+				$p = explode("=", $directive);
+				$Path = trim(urldecode($p[1]));
+			}else if($directive == 'Secure'){
+				$Secure = true;
+			}else if($directive == 'HttpOnly'){
+				$HttpOnly = true;
+			}else if(0 === strpos($directive, "SameSite")){
+				$p = explode("=", $directive);
+				$SameSite = trim($p[1])==='Strict';
+			}
+		}
+		if($protocol !== "https") $Secure = false;
+		foreach($this->cookies as $k=>$c) if($c['name'] === $name) unset($this->cookies[$k]);
+		$this->cookies[] = array('name'=>$name,'value'=>$value,'Expires'=>$Expires,'Domain'=>$Domain,'Path'=>$Path,'Secure'=>$Secure,'HttpOnly'=>$HttpOnly,'SameSite'=>$SameSite);
+	}
+	
+	/**
+	 * Get cookies that apply to the current request
+	 * @param string $host
+	 * @param string $path
+	 * @param string $protocol
+	 * @return string
+	 */
+	public function getApplicableCookies($host, $path, $protocol){
+		$cookies = array();
+		foreach($this->cookies as $cookie){
+			if($cookie['Domain'] !== $host) continue;
+			if(0 !== strpos($path, $cookie['Path'])) continue;
+			if($cookie['Secure'] && $protocol !== 'https') continue;
+			$cookies[] = "{$cookie['name']}={$cookie['value']}";
+		}
+		return implode("; ", $cookies);
+	}
+	
+	/**
+	 * Save cookie valies to file
+	 */
+	public function save(){
+		$data = array(
+			'created' => $this->created,
+			'modified' => time(),
+			'cookies' => $this->cookies
+		);
+		file_put_contents($this->filename, json_encode($data));
 	}
 	
 	/**
@@ -550,13 +638,12 @@ class HTTP_Cookiejar{
 	 * @throws Exception
 	 */
 	private function validateFile(){
-		$fh = fopen($filename, "w");
-		fclose($fh);
-		if(!is_readable($filename) || !is_writable($filename)) throw new Exception("Cannot read or write cookiefile.");
-		$contents = file_get_contents($filename);
+		$fh = fopen($this->filename, "a"); fclose($fh);
+		if(!is_readable($this->filename) || !is_writable($this->filename)) throw new Exception("Cannot read or write cookiefile.");
+		$contents = file_get_contents($this->filename);
 		if(empty($contents)) $this->initCookiejar();
-		else{
-			$json = json_decode($contents);
+		else{			
+			$json = json_decode($contents, true);
 			if(json_last_error() !== JSON_ERROR_NONE) $this->initCookiejar();
 			if(!$this->validateData($json)) $this->initCookiejar();
 		}
@@ -571,10 +658,10 @@ class HTTP_Cookiejar{
 		if(!isset($data['created']) || !is_numeric($data['created'])) return false;
 		if(!isset($data['modified']) || !is_numeric($data['modified'])) return false;
 		if(!is_array($data['cookies'])) return false;
-		$params = array('name','value','Expires','Max-Age','Domain','Path','Secure','HttpOnly','SameSite');
+		$params = array('name','value','Expires','Domain','Path','Secure','HttpOnly','SameSite');
 		foreach($data['cookies'] as $cookie){
 			foreach($params as $param){
-				if(!isset($cookie[$param])) return false;
+				if(!array_key_exists($param, $cookie)) return false;
 			}
 		}
 		return true;
@@ -583,7 +670,7 @@ class HTTP_Cookiejar{
 	/**
 	 * Initialize the cookie jar
 	 */
-	private function initCookiejar(){
+	private function initCookiejar(){ throw new Exception("ppppp");
 		$data = array(
 			'created' => time(),
 			'modified' => time(),
